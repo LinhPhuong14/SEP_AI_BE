@@ -2,32 +2,52 @@ import asyncio
 import base64
 import cv2
 import numpy as np
-import pickle
-import mediapipe as mp
 import os
-import ssl
+import time
+import json
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from collections import Counter
-from dotenv import load_dotenv
-load_dotenv()
 
-app = FastAPI()
+import mediapipe as mp
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
 
-# --- Cấu hình ---
-# Nên thay bằng địa chỉ của frontend khi triển khai thực tế
+# =================== Config ===================
 CORS_ALLOWED_ORIGINS = ["*"]
 HOST = "0.0.0.0"
 PORT = 8001
-# Ngưỡng tin cậy tối thiểu để một dự đoán được xem xét
+
+# Smoothing (giữ giống SVM server cũ)
 CONFIDENCE_THRESHOLD = 0.35
-# Số lượng dự đoán gần nhất trong lịch sử để xem xét tính ổn định
 PREDICTION_HISTORY_SIZE = 5
-# Số lần một ký tự phải xuất hiện trong lịch sử để được coi là "ổn định"
 STABILITY_THRESHOLD = 3
 
+# Model paths
+ARCH_FROM_H5 = os.path.join('Structure','Structure 6 (final)','Structure6.h5')
+WEIGHTS_PATH = os.path.join('Structure','Structure 0','Structure0.h5')
+WINDOW_LEN = 60
+HAND_ORDER = 'lh_rh'   # hoặc 'rh_lh' nếu cần
 
-# Cấu hình CORS để cho phép client từ React kết nối vào
+# =================== Labels (hard-coded) ===================
+ACTIONS = [
+    "ban dang lam gi", "ban di dau the", "ban hieu ngon ngu ky hieu khong", "ban hoc lop may", "ban khoe khong",
+    "ban muon gio roi", "ban phai canh giac", "ban ten la gi", "ban tien bo day", "ban trong cau co the",
+    "bo me toi cung la nguoi Diec", "cai nay bao nhieu tien", "cai nay la cai gi", "cam on", "cap cuu", "chuc mung",
+    "chung toi giao tiep voi nhau bang ngon ngu ky hieu", "con yeu me", "cong viec cua ban la gi", "hen gap lai cac ban",
+    "mon nay khong ngon", "toi bi chong mat", "toi bi cuop", "toi bi dau dau", "toi bi dau hong", "toi bi ket xe",
+    "toi bi lac", "toi bi phan biet doi xu", "toi cam thay rat hoi hop", "toi cam thay rat vui", "toi can an sang",
+    "toi can di ve sinh", "toi can gap bac si", "toi can phien dich", "toi can thuoc", "toi dang an sang",
+    "toi dang buon", "toi dang o ben xe", "toi dang o cong vien", "toi dang phai cach ly", "toi dang phan van",
+    "toi di sieu thi", "toi di toi Ha Noi", "toi doc kem", "toi khoi benh roi", "toi khong dem theo tien",
+    "toi khong hieu", "toi khong quan tam", "toi la hoc sinh", "toi la nguoi Diec", "toi la tho theu",
+    "toi lam viec o cua hang", "toi nham dia chi", "toi song o Ha Noi", "toi thay doi bung", "toi thay nho ban",
+    "toi thich an mi", "toi thich phim truyen", "toi viet kem", "xin chao"
+]
+
+# =================== FastAPI app ===================
+app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOWED_ORIGINS,
@@ -36,229 +56,178 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Xác định đường dẫn tuyệt đối ---
-# Lấy đường dẫn của thư mục chứa file script này
-script_dir = os.path.dirname(os.path.abspath(__file__))
-
-# Đường dẫn đến thư mục chứa model và dữ liệu training
-model_data_path = os.path.join(script_dir, 'model_data')
-
-model_path = os.path.join(model_data_path, 'svm_model.pkl')
-training_data_path = os.path.join(model_data_path, 'training_data')
-
-
-class ConnectionManager:
-    """Quản lý các kết nối WebSocket."""
-    def __init__(self):
-        self.active_connections: list[WebSocket] = []
-
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
-
-    async def broadcast(self, message: str):
-        for connection in self.active_connections:
-            await connection.send_text(message)
-
-manager = ConnectionManager()
-
-# --- Tải mô hình AI và các thành phần cần thiết ---
-try:
-    # Tải mô hình SVM đã được huấn luyện
-    with open(model_path, 'rb') as f:
-        model = pickle.load(f)
-
-    # Lấy danh sách các nhãn (tên các ký tự) từ thư mục dữ liệu huấn luyện
-    labels = sorted([d for d in os.listdir(training_data_path) if os.path.isdir(os.path.join(training_data_path, d))])
-
-    # Khởi tạo MediaPipe Hands
-    mp_hands = mp.solutions.hands
-    # Dùng static_image_mode=False để detector chạy 1 lần rồi tracking → nhanh hơn
-    hands = mp_hands.Hands(
+# =================== MediaPipe ===================
+mp_hands = mp.solutions.hands
+def create_hands():
+    return mp_hands.Hands(
         static_image_mode=False,
         max_num_hands=1,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
-except Exception as e:
-    print(f"Lỗi khi khởi tạo AI: {e}")
-    model = None
-    labels = []
-    hands = None
 
-def eulidean_distance(landmarkA, landmarkB):
-    """Tính khoảng cách Euclidean giữa hai điểm mốc."""
-    A = np.array([landmarkA.x, landmarkA.y])
-    B = np.array([landmarkB.x, landmarkB.y])
-    distance = np.linalg.norm(A-B)
-    return distance
+def hand_to_np(hand):
+    if hand is None:
+        return np.zeros(21*3, dtype=np.float32)
+    return np.array([[lm.x, lm.y, lm.z] for lm in hand.landmark], dtype=np.float32).flatten()
 
-def extract_features(landmarks):
-    """Trích xuất vector đặc trưng từ các điểm mốc bàn tay."""
-    data = []
-    # Logic này được sao chép từ notebook svm_training.ipynb
-    # Đảm bảo thứ tự các khoảng cách là giống hệt
-    data.append(eulidean_distance(landmarks[4], landmarks[0]))
-    data.append(eulidean_distance(landmarks[8], landmarks[0]))
-    data.append(eulidean_distance(landmarks[12], landmarks[0]))
-    data.append(eulidean_distance(landmarks[16], landmarks[0]))
-    data.append(eulidean_distance(landmarks[20], landmarks[0]))
-    data.append(eulidean_distance(landmarks[4], landmarks[8]))
-    data.append(eulidean_distance(landmarks[4], landmarks[12]))
-    data.append(eulidean_distance(landmarks[8], landmarks[12]))
-    data.append(eulidean_distance(landmarks[12], landmarks[16]))
-    data.append(eulidean_distance(landmarks[20], landmarks[16]))
-    data.append(eulidean_distance(landmarks[8], landmarks[16]))
-    data.append(eulidean_distance(landmarks[8], landmarks[20]))
-    data.append(eulidean_distance(landmarks[12], landmarks[20]))
-    data.append(eulidean_distance(landmarks[4], landmarks[16]))
-    data.append(eulidean_distance(landmarks[4], landmarks[20]))
-    data.append(eulidean_distance(landmarks[5], landmarks[9]))
-    
-    return np.array(data)
+def extract_keypoints_hands(results, hand_order='lh_rh'):
+    lh = hand_to_np(results.left_hand_landmarks if results else None)
+    rh = hand_to_np(results.right_hand_landmarks if results else None)
+    if hand_order == 'rh_lh':
+        return np.concatenate([rh, lh], axis=0)
+    return np.concatenate([lh, rh], axis=0)
 
-def predict_sign_language(image_np, hands_instance=None):
-    """
-    Hàm xử lý ảnh và dịch ngôn ngữ ký hiệu.
-    Trả về một tuple (ký tự dự đoán, độ tin cậy) nếu hợp lệ,
-    ngược lại trả về None.
-    """
-    hands_to_use = hands_instance or hands
-    if model is None or hands_to_use is None or not labels:
-        print("Lỗi: Mô hình AI chưa được tải.")
+def mp_process_bgr(image_bgr, hands_instance):
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    results = hands_instance.process(image_rgb)
+    return results
+
+# =================== Model ===================
+def inspect_structure(h5_path):
+    import h5py
+    info = {}
+    with h5py.File(h5_path, 'r') as f:
+        def visit(n, o):
+            if isinstance(o, h5py.Dataset) and n.endswith('kernel:0'):
+                shape = o.shape
+                if len(shape) == 2:
+                    if '/lstm_2/' in n:
+                        info['lstm_2_units'] = int(shape[1] // 4)
+                    elif '/lstm_1/' in n:
+                        info['lstm_1_units'] = int(shape[1] // 4)
+                    elif '/lstm/' in n:
+                        info['lstm_units'] = int(shape[1] // 4)
+                    if '/dense_1/' in n:
+                        info['dense_1_units'] = int(shape[1])
+                    elif '/dense/' in n and 'dense_1' not in n and 'dense_2' not in n:
+                        info['dense_units'] = int(shape[1])
+                    if '/dense_2/' in n:
+                        info['num_classes'] = int(shape[1])
+        f.visititems(visit)
+    info.setdefault('lstm_units', 64)
+    info.setdefault('lstm_1_units', 128)
+    info.setdefault('lstm_2_units', 64)
+    info.setdefault('dense_units', 64)
+    info.setdefault('dense_1_units', 32)
+    return info
+
+def build_model(info, num_classes, window_len):
+    m = Sequential()
+    m.add(LSTM(info.get('lstm_units',64), return_sequences=True, activation='relu', input_shape=(window_len,126)))
+    m.add(LSTM(info.get('lstm_1_units',128), return_sequences=True, activation='relu'))
+    m.add(LSTM(info.get('lstm_2_units',64), return_sequences=False, activation='relu'))
+    m.add(Dense(info.get('dense_units',64), activation='relu'))
+    m.add(Dense(info.get('dense_1_units',32), activation='relu'))
+    m.add(Dense(num_classes, activation='softmax'))
+    return m
+
+# =================== Predictor ===================
+class LSTMPredictor:
+    def __init__(self, model, labels, window_len=60, hand_order='lh_rh'):
+        self.model = model
+        self.labels = labels
+        self.window_len = window_len
+        self.hand_order = hand_order
+        self.seq = []
+        self.pred_history = []
+        self.last_sent = None
+
+    def reset_segment(self):
+        self.seq.clear()
+        self.pred_history.clear()
+        self.last_sent = None
+
+    def process_bgr(self, frame_bgr, hands_instance):
+        """Return (label, conf) when stable; '' to clear; or None to send nothing."""
+        results = mp_process_bgr(frame_bgr, hands_instance)
+        hands_present = bool(results and (results.left_hand_landmarks or results.right_hand_landmarks))
+
+        if not hands_present:
+            if self.last_sent is not None:
+                self.reset_segment()
+                return ""
+            self.reset_segment()
+            return None
+
+        feat = extract_keypoints_hands(results, self.hand_order)
+        self.seq.append(feat)
+        if len(self.seq) < self.window_len:
+            return None
+        self.seq = self.seq[-self.window_len:]
+
+        x = np.array(self.seq, dtype=np.float32)[None, ...]
+        probs = self.model.predict(x, verbose=0)[0]
+        idx = int(np.argmax(probs))
+        conf = float(probs[idx])
+        label = self.labels[idx] if idx < len(self.labels) else f'class_{idx}'
+
+        if conf >= CONFIDENCE_THRESHOLD:
+            self.pred_history.append(label)
+            if len(self.pred_history) > PREDICTION_HISTORY_SIZE:
+                self.pred_history.pop(0)
+            if self.pred_history.count(label) >= STABILITY_THRESHOLD:
+                if label != self.last_sent:
+                    self.last_sent = label
+                    return (label, conf)
         return None
 
-    # Chuyển ảnh sang RGB vì MediaPipe yêu cầu
-    image_rgb = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-    results = hands_to_use.process(image_rgb)
+# =================== Initialize ===================
+try:
+    labels = ACTIONS[:]  # dùng danh sách hard-coded
+    info = inspect_structure(ARCH_FROM_H5)
+    model = build_model(info, num_classes=len(labels), window_len=WINDOW_LEN)
+    model.load_weights(WEIGHTS_PATH)
+except Exception as e:
+    print(f"[FATAL] Failed to load LSTM model/labels: {e}")
+    labels = []
+    model = None
 
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-            # Trích xuất đặc trưng
-            features = extract_features(hand_landmarks.landmark)
-            
-            # Đưa ra dự đoán
-            prediction_idx = model.predict([features])[0]
-            predicted_char = labels[prediction_idx]
-            
-            # Lấy xác suất của dự đoán
-            prediction_proba = model.predict_proba([features])[0]
-            confidence = np.max(prediction_proba)
-
-            # In thông tin gỡ lỗi ra terminal
-            print(f"Phát hiện: {predicted_char}, Độ tin cậy: {confidence:.2f}")
-
-            # Chỉ trả về kết quả nếu độ tin cậy cao
-            if confidence > CONFIDENCE_THRESHOLD:
-                return predicted_char, confidence
-    else:
-        # Thêm log khi không phát hiện thấy tay
-        print("Không phát hiện thấy tay trong khung hình.")
-    
-    return None # Không phát hiện thấy tay hoặc không đủ tự tin
-
-# ------------------------------------
-
+# =================== WebSocket ===================
 @app.websocket("/ws/translate")
 async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
-    # Khởi tạo Hands riêng cho từng client
-    hands_instance = mp.solutions.hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-    prediction_history = []
-    last_sent_char = None
-    import time
-    MIN_INTERVAL = 0.15  # giãn cách tối thiểu giữa 2 lần infer (≈6-7fps)
-    last_infer = 0
+    await websocket.accept()
+    if model is None or not labels:
+        await websocket.send_text("Server error: model not loaded")
+        await websocket.close()
+        return
+
+    hands_instance = create_hands()
+    predictor = LSTMPredictor(model, labels, window_len=WINDOW_LEN, hand_order=HAND_ORDER)
+
+    MIN_INTERVAL = 0.15
+    last_infer = 0.0
+
     try:
         while True:
             data = await websocket.receive_text()
-            if data.startswith('data:image/jpeg;base64,'):
-                # Loại bỏ phần tiền tố "data:image/jpeg;base64,"
-                base64_data = data.split(',')[1]
-                
-                # Giải mã base64 thành dữ liệu nhị phân
-                image_bytes = base64.b64decode(base64_data)
-                
-                # Chuyển dữ liệu nhị phân thành mảng numpy
-                np_arr = np.frombuffer(image_bytes, np.uint8)
-                
-                # Đọc ảnh từ mảng numpy bằng OpenCV
-                img_np = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if not data.startswith('data:image/jpeg;base64,'):
+                continue
+            base64_data = data.split(',')[1]
+            image_bytes = base64.b64decode(base64_data)
+            np_arr = np.frombuffer(image_bytes, np.uint8)
+            img_np = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-                # Giới hạn tốc độ suy luận
-                now = time.time()
-                if now - last_infer < MIN_INTERVAL:
-                    continue
-                last_infer = now
+            now = time.time()
+            if now - last_infer < MIN_INTERVAL:
+                continue
+            last_infer = now
 
-                # --- Gọi hàm xử lý AI ---
-                prediction = predict_sign_language(img_np, hands_instance)
-                # -------------------------
-
-                if prediction:
-                    predicted_char, confidence = prediction
-                    prediction_history.append(predicted_char)
-
-                    # Giới hạn kích thước của lịch sử dự đoán
-                    if len(prediction_history) > PREDICTION_HISTORY_SIZE:
-                        prediction_history.pop(0)
-
-                    # Tìm ký tự xuất hiện nhiều nhất trong lịch sử
-                    if prediction_history:
-                        most_common_char = Counter(prediction_history).most_common(1)[0][0]
-                        
-                        # Kiểm tra xem ký tự đó có đủ "ổn định" không
-                        if prediction_history.count(most_common_char) >= STABILITY_THRESHOLD:
-                            # Chỉ gửi nếu ký tự ổn định khác với ký tự đã gửi lần cuối
-                            if most_common_char != last_sent_char:
-                                last_sent_char = most_common_char
-                                response = f"{last_sent_char} ({int(confidence*100)}%)"
-                                print(f"--- GỬI VỀ FRONTEND: '{response}' ---")
-                                await websocket.send_text(response)
-                else:
-                    # Nếu không nhận diện được (tay biến mất), gửi tín hiệu xóa
-                    # và reset trạng thái để có thể nhận diện ký tự mới ngay lập tức
-                    if last_sent_char is not None:
-                        print("--- GỬI VỀ FRONTEND: '' (Tín hiệu xóa) ---")
-                        await websocket.send_text("")
-                        prediction_history.clear()
-                        last_sent_char = None
-
+            result = predictor.process_bgr(img_np, hands_instance)
+            if result is None:
+                continue
+            if result == "":
+                await websocket.send_text("")   # clear
+                continue
+            label, conf = result
+            await websocket.send_text(f"{label} ({int(conf*100)}%)")
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
-        print("Client disconnected")
+        pass
     except Exception as e:
-        print(f"Error: {e}")
-        manager.disconnect(websocket)
+        print(f"[WS ERROR] {e}")
     finally:
-        # Đảm bảo giải phóng tài nguyên MediaPipe
         hands_instance.close()
 
 if __name__ == "__main__":
     import uvicorn
-    # Đọc đường dẫn file SSL từ biến môi trường hoặc default vào thư mục certs
-    certfile = os.environ.get("SSL_CRT_FILE") or os.environ.get("SSL_CERT_PATH") or "certs/cert.pem"
-    keyfile = os.environ.get("SSL_KEY_FILE") or os.environ.get("SSL_KEY_PATH") or "certs/key.pem"
-    ssl_args = {}
-    # Nếu cả hai file tồn tại thì tạo SSLContext và hạ SecLevel
-    if os.path.exists(certfile) and os.path.exists(keyfile):
-        print(f"Running with HTTPS using certs at {certfile} and {keyfile}")
-        uvicorn.run(
-            app,
-            host=HOST,
-            port=PORT,
-            ssl_certfile=certfile,
-            ssl_keyfile=keyfile,
-            ssl_ciphers="DEFAULT:@SECLEVEL=1",
-        )
-    else:
-        print(f"Warning: SSL files not found at {certfile} and {keyfile}, running without SSL")
-        uvicorn.run(app, host=HOST, port=PORT) 
+    uvicorn.run(app, host=HOST, port=PORT)
