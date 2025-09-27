@@ -4,11 +4,18 @@ import os, time, cv2, numpy as np, mediapipe as mp, tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 
-# ====== Model defaults ======
+# ====== Model paths ======
 ARCH_FROM_H5 = os.path.join('Structure','Structure 6 (final)','Structure6.h5')
 WEIGHTS_PATH = os.path.join('Structure','Structure 0','Structure0.h5')
-WINDOW_LEN = 30
-HAND_ORDER = 'rh_lh'  # hoặc 'rh_lh' nếu train theo right->left
+HAND_ORDER = 'lh_rh'  # hoặc 'rh_lh'
+
+# ====== Ẩn: độ dài tensor cho LSTM ======
+_TARGET_SEQ_LEN = 60
+
+# ====== Trigger segment ======
+NOHAND_DEBOUNCE = 8
+MIN_SEGMENT = 20
+CONFIDENCE_THRESHOLD = 0.35
 
 # ====== Labels (hard-coded) ======
 ACTIONS = [
@@ -25,11 +32,6 @@ ACTIONS = [
     "toi lam viec o cua hang", "toi nham dia chi", "toi song o Ha Noi", "toi thay doi bung", "toi thay nho ban",
     "toi thich an mi", "toi thich phim truyen", "toi viet kem", "xin chao"
 ]
-
-# ====== Smoothing (giống server) ======
-CONFIDENCE_THRESHOLD = 0.35
-PREDICTION_HISTORY_SIZE = 5
-STABILITY_THRESHOLD = 3
 
 # ====== MediaPipe (Holistic) ======
 mp_holistic = mp.solutions.holistic
@@ -55,7 +57,7 @@ def extract_keypoints_hands(results, hand_order='lh_rh'):
         return np.concatenate([rh, lh], axis=0)
     return np.concatenate([lh, rh], axis=0)
 
-# ====== Build model from Structure6 + load weights Structure0 ======
+# ====== Model build ======
 def inspect_structure(h5_path):
     import h5py
     info = {}
@@ -84,9 +86,9 @@ def inspect_structure(h5_path):
     info.setdefault('dense_1_units', 32)
     return info
 
-def build_model(info, num_classes, window_len):
+def build_model(info, num_classes):
     m = Sequential()
-    m.add(LSTM(info.get('lstm_units',64), return_sequences=True, activation='relu', input_shape=(window_len,126)))
+    m.add(LSTM(info.get('lstm_units',64), return_sequences=True, activation='relu', input_shape=(_TARGET_SEQ_LEN,126)))
     m.add(LSTM(info.get('lstm_1_units',128), return_sequences=True, activation='relu'))
     m.add(LSTM(info.get('lstm_2_units',64), return_sequences=False, activation='relu'))
     m.add(Dense(info.get('dense_units',64), activation='relu'))
@@ -94,10 +96,20 @@ def build_model(info, num_classes, window_len):
     m.add(Dense(num_classes, activation='softmax'))
     return m
 
+def _prepare_tensor(segment):
+    if len(segment) == 0:
+        return None
+    if len(segment) >= _TARGET_SEQ_LEN:
+        x = np.array(segment[-_TARGET_SEQ_LEN:], dtype=np.float32)
+    else:
+        last = segment[-1]
+        x = np.array(segment + [last] * (_TARGET_SEQ_LEN - len(segment)), dtype=np.float32)
+    return x[None, ...]
+
 def main():
-    labels = ACTIONS[:]  # hard-coded
+    labels = ACTIONS[:]
     info = inspect_structure(ARCH_FROM_H5)
-    model = build_model(info, len(labels), WINDOW_LEN)
+    model = build_model(info, len(labels))
     model.load_weights(WEIGHTS_PATH)
 
     holistic = create_holistic()
@@ -106,68 +118,52 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    seq, history, last_sent = [], [], None
+    segment = []
+    nohand_count = 0
+    sent_this_gap = False
+    last_overlay = ''
 
     try:
-        print("[INFO] Collecting frames... (press 'q' to quit)")
+        print("[INFO] Segment mode: predict when hands disappear (q to quit)")
         while True:
             ret, frame = cap.read()
             if not ret:
                 print("[WARN] Camera read failed"); break
-  # we'll implement inline
-            # Inline process (avoid extra function for clarity)
+
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = holistic.process(image_rgb)
 
             hands_present = bool(results and (results.left_hand_landmarks or results.right_hand_landmarks))
-            if not hands_present:
-                if last_sent is not None:
-                    last_sent = None
-                    history.clear()
-                    seq.clear()
-                    print("[CLR]")
-                cv2.putText(frame, '', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-                cv2.imshow('realtime_test', frame)
-                if (cv2.waitKey(1) & 0xFF) == ord('q'): break
-                continue
 
-            feat = extract_keypoints_hands(results, HAND_ORDER)
-            seq.append(feat)
-            if len(seq) < WINDOW_LEN:
-                cv2.putText(frame, '', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-                cv2.imshow('realtime_test', frame)
-                if (cv2.waitKey(1) & 0xFF) == ord('q'): break
-                continue
+            if hands_present:
+                nohand_count = 0
+                sent_this_gap = False
+                feat = extract_keypoints_hands(results, HAND_ORDER)
+                segment.append(feat)
+            else:
+                nohand_count += 1
+                if nohand_count == NOHAND_DEBOUNCE:
+                    if len(segment) >= MIN_SEGMENT:
+                        x = _prepare_tensor(segment)
+                        probs = model.predict(x, verbose=0)[0]
+                        idx = int(np.argmax(probs))
+                        conf = float(probs[idx])
+                        if conf >= CONFIDENCE_THRESHOLD:
+                            last_overlay = labels[idx] if idx < len(labels) else f'class_{idx}'
+                            print(f"[WORD] {last_overlay} ({int(conf*100)}%)")
+                            sent_this_gap = True
+                        segment = []  # clear sau quyết định
+                elif sent_this_gap and nohand_count > NOHAND_DEBOUNCE:
+                    # gửi tín hiệu clear UI (ở bản test: chỉ xoá overlay)
+                    last_overlay = ''
 
-            # Predict mỗi frame khi đã đủ window_len (sliding window)
-            seq = seq[-WINDOW_LEN:]
-            x = np.array(seq, dtype=np.float32)[None, ...]
-            probs = model.predict(x, verbose=0)[0]
-            idx = int(np.argmax(probs))
-            conf = float(probs[idx])
-            label = labels[idx] if idx < len(labels) else f'class_{idx}'
-
-            if conf >= CONFIDENCE_THRESHOLD:
-                history.append(label)
-                if len(history) > PREDICTION_HISTORY_SIZE:
-                    history.pop(0)
-                if history.count(label) >= STABILITY_THRESHOLD:
-                    if label != last_sent:
-                        last_sent = label
-                        print(f"[PRED] {label} ({int(conf*100)}%)")
-
-            cv2.putText(frame, last_sent or '', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+            cv2.putText(frame, last_overlay, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
             cv2.imshow('realtime_test', frame)
             if (cv2.waitKey(1) & 0xFF) == ord('q'): break
     finally:
         cap.release()
         holistic.close()
         cv2.destroyAllWindows()
-
-# helper for parity with server
-def mp_process_bgr(image_bgr, holistic):
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    return holistic.process(image_rgb)
 
 if __name__ == "__main__":
     main()

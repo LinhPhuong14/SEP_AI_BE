@@ -18,16 +18,20 @@ CORS_ALLOWED_ORIGINS = ["*"]
 HOST = "0.0.0.0"
 PORT = 8001
 
-# Smoothing (giữ giống SVM server cũ)
+# Ngưỡng dự đoán
 CONFIDENCE_THRESHOLD = 0.35
-PREDICTION_HISTORY_SIZE = 5
-STABILITY_THRESHOLD = 3
+
+# Trigger segment
+NOHAND_DEBOUNCE = 8   # số frame "no-hand" liên tiếp để chốt 1 từ
+MIN_SEGMENT = 20      # tối thiểu số frame có tay trong 1 từ để chấp nhận
 
 # Model paths
 ARCH_FROM_H5 = os.path.join('Structure','Structure 6 (final)','Structure6.h5')
 WEIGHTS_PATH = os.path.join('Structure','Structure 0','Structure0.h5')
-WINDOW_LEN = 60
 HAND_ORDER = 'lh_rh'   # hoặc 'rh_lh' nếu cần
+
+# Fixed timesteps cho LSTM (ẩn, không expose)
+_TARGET_SEQ_LEN = 60
 
 # =================== Labels (hard-coded) ===================
 ACTIONS = [
@@ -55,7 +59,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =================== MediaPipe (Holistic để có left/right) ===================
+# =================== MediaPipe (Holistic) ===================
 mp_holistic = mp.solutions.holistic
 
 def create_holistic():
@@ -79,11 +83,6 @@ def extract_keypoints_hands(results, hand_order='lh_rh'):
     if hand_order == 'rh_lh':
         return np.concatenate([rh, lh], axis=0)
     return np.concatenate([lh, rh], axis=0)
-
-def mp_process_bgr(image_bgr, holistic_instance):
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    results = holistic_instance.process(image_rgb)
-    return results
 
 # =================== Model ===================
 def inspect_structure(h5_path):
@@ -114,9 +113,9 @@ def inspect_structure(h5_path):
     info.setdefault('dense_1_units', 32)
     return info
 
-def build_model(info, num_classes, window_len):
+def build_model(info, num_classes):
     m = Sequential()
-    m.add(LSTM(info.get('lstm_units',64), return_sequences=True, activation='relu', input_shape=(window_len,126)))
+    m.add(LSTM(info.get('lstm_units',64), return_sequences=True, activation='relu', input_shape=(_TARGET_SEQ_LEN,126)))
     m.add(LSTM(info.get('lstm_1_units',128), return_sequences=True, activation='relu'))
     m.add(LSTM(info.get('lstm_2_units',64), return_sequences=False, activation='relu'))
     m.add(Dense(info.get('dense_units',64), activation='relu'))
@@ -124,61 +123,81 @@ def build_model(info, num_classes, window_len):
     m.add(Dense(num_classes, activation='softmax'))
     return m
 
-# =================== Predictor ===================
+def _prepare_tensor(segment):
+    """Pad/truncate segment về _TARGET_SEQ_LEN."""
+    if len(segment) == 0:
+        return None
+    if len(segment) >= _TARGET_SEQ_LEN:
+        x = np.array(segment[-_TARGET_SEQ_LEN:], dtype=np.float32)
+    else:
+        last = segment[-1]
+        x = np.array(segment + [last] * (_TARGET_SEQ_LEN - len(segment)), dtype=np.float32)
+    return x[None, ...]  # (1, T, 126)
+
+# =================== Predictor (segment-based) ===================
 class LSTMPredictor:
-    def __init__(self, model, labels, window_len=60, hand_order='lh_rh'):
+    def __init__(self, model, labels, hand_order='lh_rh'):
         self.model = model
         self.labels = labels
-        self.window_len = window_len
         self.hand_order = hand_order
-        self.seq = []
-        self.pred_history = []
-        self.last_sent = None
+        self.segment = []        # đang gom 1 từ
+        self.nohand_count = 0
+        self.sent_this_gap = False  # đã gửi nhãn cho segment vừa kết thúc chưa
 
     def reset_segment(self):
-        self.seq.clear()
-        self.pred_history.clear()
-        self.last_sent = None
+        self.segment.clear()
+        self.nohand_count = 0
+        self.sent_this_gap = False
 
     def process_bgr(self, frame_bgr, holistic_instance):
-        """Return (label, conf) when stable; '' to clear; or None to send nothing."""
-        results = mp_process_bgr(frame_bgr, holistic_instance)
+        """
+        Returns:
+          - (label, conf) đúng 1 lần khi vừa mất tay đủ debounce và segment>=MIN_SEGMENT
+          - ""  : clear UI khi đã gửi label xong và vẫn đang "no-hand"
+          - None: các trạng thái khác (đang gom/không đủ điều kiện)
+        """
+        image_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        results = holistic_instance.process(image_rgb)
+
         hands_present = bool(results and (results.left_hand_landmarks or results.right_hand_landmarks))
 
-        if not hands_present:
-            if self.last_sent is not None:
-                self.reset_segment()
-                return ""
-            self.reset_segment()
+        if hands_present:
+            self.nohand_count = 0
+            self.sent_this_gap = False  # vì có tay lại
+            feat = extract_keypoints_hands(results, self.hand_order)
+            self.segment.append(feat)
             return None
 
-        feat = extract_keypoints_hands(results, self.hand_order)
-        self.seq.append(feat)
-        if len(self.seq) < self.window_len:
-            return None
-        self.seq = self.seq[-self.window_len:]
-
-        x = np.array(self.seq, dtype=np.float32)[None, ...]
-        probs = self.model.predict(x, verbose=0)[0]
-        idx = int(np.argmax(probs))
-        conf = float(probs[idx])
-        label = self.labels[idx] if idx < len(self.labels) else f'class_{idx}'
-
-        if conf >= CONFIDENCE_THRESHOLD:
-            self.pred_history.append(label)
-            if len(self.pred_history) > PREDICTION_HISTORY_SIZE:
-                self.pred_history.pop(0)
-            if self.pred_history.count(label) >= STABILITY_THRESHOLD:
-                if label != self.last_sent:
-                    self.last_sent = label
+        # no-hand
+        self.nohand_count += 1
+        if self.nohand_count == NOHAND_DEBOUNCE:
+            # chốt 1 từ nếu đủ dài
+            if len(self.segment) >= MIN_SEGMENT:
+                x = _prepare_tensor(self.segment)
+                probs = self.model.predict(x, verbose=0)[0]
+                idx = int(np.argmax(probs))
+                conf = float(probs[idx])
+                if conf >= CONFIDENCE_THRESHOLD:
+                    label = self.labels[idx] if idx < len(self.labels) else f'class_{idx}'
+                    self.sent_this_gap = True
+                    self.segment = []  # clear sau khi quyết định
                     return (label, conf)
+            # không đủ dài hoặc conf thấp: bỏ
+            self.segment = []
+
+        # Nếu đã gửi label ở gap này thì trả clear cho UI ở khung no-hand tiếp theo
+        if self.sent_this_gap and self.nohand_count > NOHAND_DEBOUNCE:
+            # reset để vòng mới
+            self.reset_segment()
+            return ""
+
         return None
 
 # =================== Initialize ===================
 try:
-    labels = ACTIONS[:]  # hard-coded labels
+    labels = ACTIONS[:]
     info = inspect_structure(ARCH_FROM_H5)
-    model = build_model(info, num_classes=len(labels), window_len=WINDOW_LEN)
+    model = build_model(info, num_classes=len(labels))
     model.load_weights(WEIGHTS_PATH)
 except Exception as e:
     print(f"[FATAL] Failed to load LSTM model/labels: {e}")
@@ -195,9 +214,9 @@ async def websocket_endpoint(websocket: WebSocket):
         return
 
     holistic = create_holistic()
-    predictor = LSTMPredictor(model, labels, window_len=WINDOW_LEN, hand_order=HAND_ORDER)
+    predictor = LSTMPredictor(model, labels, hand_order=HAND_ORDER)
 
-    MIN_INTERVAL = 0.15
+    MIN_INTERVAL = 0.10  # nhẹ nhàng 10fps
     last_infer = 0.0
 
     try:
@@ -215,13 +234,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
             last_infer = now
 
-            result = predictor.process_bgr(img_np, holistic)
-            if result is None:
+            out = predictor.process_bgr(img_np, holistic)
+            if out is None:
                 continue
-            if result == "":
+            if out == "":
                 await websocket.send_text("")   # clear
                 continue
-            label, conf = result
+            label, conf = out
             await websocket.send_text(f"{label} ({int(conf*100)}%)")
     except WebSocketDisconnect:
         pass
