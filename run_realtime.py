@@ -7,8 +7,8 @@ from tensorflow.keras.layers import LSTM, Dense
 # ====== Model defaults ======
 ARCH_FROM_H5 = os.path.join('Structure','Structure 6 (final)','Structure6.h5')
 WEIGHTS_PATH = os.path.join('Structure','Structure 0','Structure0.h5')
-WINDOW_LEN = 60
-HAND_ORDER = 'lh_rh'  # đổi 'rh_lh' nếu train theo right->left
+WINDOW_LEN = 30
+HAND_ORDER = 'rh_lh'  # hoặc 'rh_lh' nếu train theo right->left
 
 # ====== Labels (hard-coded) ======
 ACTIONS = [
@@ -31,7 +31,18 @@ CONFIDENCE_THRESHOLD = 0.35
 PREDICTION_HISTORY_SIZE = 5
 STABILITY_THRESHOLD = 3
 
-# ====== MediaPipe helpers ======
+# ====== MediaPipe (Holistic) ======
+mp_holistic = mp.solutions.holistic
+def create_holistic():
+    return mp_holistic.Holistic(
+        static_image_mode=False,
+        model_complexity=1,
+        enable_segmentation=False,
+        refine_face_landmarks=False,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+
 def hand_to_np(hand):
     if hand is None:
         return np.zeros(21*3, dtype=np.float32)
@@ -89,9 +100,7 @@ def main():
     model = build_model(info, len(labels), WINDOW_LEN)
     model.load_weights(WEIGHTS_PATH)
 
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(static_image_mode=False, max_num_hands=1,
-                           min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    holistic = create_holistic()
 
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -105,9 +114,10 @@ def main():
             ret, frame = cap.read()
             if not ret:
                 print("[WARN] Camera read failed"); break
-
+  # we'll implement inline
+            # Inline process (avoid extra function for clarity)
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = hands.process(image_rgb)
+            results = holistic.process(image_rgb)
 
             hands_present = bool(results and (results.left_hand_landmarks or results.right_hand_landmarks))
             if not hands_present:
@@ -151,8 +161,13 @@ def main():
             if (cv2.waitKey(1) & 0xFF) == ord('q'): break
     finally:
         cap.release()
-        hands.close()
+        holistic.close()
         cv2.destroyAllWindows()
+
+# helper for parity with server
+def mp_process_bgr(image_bgr, holistic):
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    return holistic.process(image_rgb)
 
 if __name__ == "__main__":
     main()

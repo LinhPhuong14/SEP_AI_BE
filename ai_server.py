@@ -4,7 +4,6 @@ import cv2
 import numpy as np
 import os
 import time
-import json
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -56,12 +55,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =================== MediaPipe ===================
-mp_hands = mp.solutions.hands
-def create_hands():
-    return mp_hands.Hands(
+# =================== MediaPipe (Holistic để có left/right) ===================
+mp_holistic = mp.solutions.holistic
+
+def create_holistic():
+    return mp_holistic.Holistic(
         static_image_mode=False,
-        max_num_hands=1,
+        model_complexity=1,
+        enable_segmentation=False,
+        refine_face_landmarks=False,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     )
@@ -78,9 +80,9 @@ def extract_keypoints_hands(results, hand_order='lh_rh'):
         return np.concatenate([rh, lh], axis=0)
     return np.concatenate([lh, rh], axis=0)
 
-def mp_process_bgr(image_bgr, hands_instance):
+def mp_process_bgr(image_bgr, holistic_instance):
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    results = hands_instance.process(image_rgb)
+    results = holistic_instance.process(image_rgb)
     return results
 
 # =================== Model ===================
@@ -138,9 +140,9 @@ class LSTMPredictor:
         self.pred_history.clear()
         self.last_sent = None
 
-    def process_bgr(self, frame_bgr, hands_instance):
+    def process_bgr(self, frame_bgr, holistic_instance):
         """Return (label, conf) when stable; '' to clear; or None to send nothing."""
-        results = mp_process_bgr(frame_bgr, hands_instance)
+        results = mp_process_bgr(frame_bgr, holistic_instance)
         hands_present = bool(results and (results.left_hand_landmarks or results.right_hand_landmarks))
 
         if not hands_present:
@@ -174,7 +176,7 @@ class LSTMPredictor:
 
 # =================== Initialize ===================
 try:
-    labels = ACTIONS[:]  # dùng danh sách hard-coded
+    labels = ACTIONS[:]  # hard-coded labels
     info = inspect_structure(ARCH_FROM_H5)
     model = build_model(info, num_classes=len(labels), window_len=WINDOW_LEN)
     model.load_weights(WEIGHTS_PATH)
@@ -192,7 +194,7 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close()
         return
 
-    hands_instance = create_hands()
+    holistic = create_holistic()
     predictor = LSTMPredictor(model, labels, window_len=WINDOW_LEN, hand_order=HAND_ORDER)
 
     MIN_INTERVAL = 0.15
@@ -213,7 +215,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
             last_infer = now
 
-            result = predictor.process_bgr(img_np, hands_instance)
+            result = predictor.process_bgr(img_np, holistic)
             if result is None:
                 continue
             if result == "":
@@ -226,7 +228,7 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         print(f"[WS ERROR] {e}")
     finally:
-        hands_instance.close()
+        holistic.close()
 
 if __name__ == "__main__":
     import uvicorn
